@@ -81,17 +81,11 @@ static double		gammln();
  fieldstruct	**infields;
 
 #ifdef USE_THREADS
- pthread_t		*thread,
-			movthread;
+ pthread_t		*thread;
  pthread_mutex_t	coaddmutex;
- threads_gate_t		*pthread_startgate, *pthread_stopgate,
-			*pthread_startgate2, *pthread_stopgate2;
- FLAGTYPE		*pthread_lineibuf, *pthread_multiibuf;
- PIXTYPE		*pthread_linebuf, *pthread_multibuf;
- unsigned int		*pthread_multinbuf, *pthread_multiobuf,
-			*pthread_baseline_y, *pthread_origin;
- int			pthread_bufline, pthread_nbuflines, pthread_npix,
-			pthread_step, pthread_endflag, pthread_wdataflag;
+ threads_gate_t		*pthread_startgate, *pthread_stopgate;
+ unsigned int		*pthread_baseline_y;
+ int			pthread_bufline, pthread_nbuflines, pthread_endflag;
 #endif
 
 /*------------------------------ function -----------------------------------*/
@@ -116,8 +110,7 @@ static void	max_clique_recur(unsigned int *array, int nnode, int *old,
 			int **best, int *nbest);
 
 #ifdef USE_THREADS
- static void	*pthread_coadd_lines(void *arg),
-		*pthread_move_lines(void *arg);
+ static void	*pthread_coadd_lines(void *arg);
 #endif
 
 #ifdef HAVE_CFITSIO
@@ -586,8 +579,6 @@ int coadd_fields(fieldstruct **infield, fieldstruct **inwfield, int ninput,
   QPTHREAD_ATTR_SETDETACHSTATE(&pthread_attr, PTHREAD_CREATE_JOINABLE);
   pthread_startgate = threads_gate_init(nproc+1, NULL);
   pthread_stopgate = threads_gate_init(nproc+1, NULL);
-  pthread_startgate2 = threads_gate_init(2, NULL);
-  pthread_stopgate2 = threads_gate_init(2, NULL);
   QMALLOC(proc, int, nproc);
   QMALLOC(thread, pthread_t, nproc);
   pthread_bufline = pthread_nbuflines = nbuflinesmax;
@@ -598,8 +589,9 @@ int coadd_fields(fieldstruct **infield, fieldstruct **inwfield, int ninput,
     proc[p] = p;
     QPTHREAD_CREATE(&thread[p], &pthread_attr, &pthread_coadd_lines, &bufmin);
     }
-/* Start the data mover thread */
-  QPTHREAD_CREATE(&movthread, &pthread_attr, &pthread_move_lines, &p);
+/* Input lines are read and scattered inline by the main thread (see
+   coadd_load()): the former per-line hand-shake with a separate "mover"
+   thread cost more than the move itself. */
 #endif
 
   nopenfiles = 0;
@@ -845,15 +837,11 @@ int coadd_fields(fieldstruct **infield, fieldstruct **inwfield, int ninput,
   pthread_endflag = 1;
 /* (Re-)activate existing threads... */
   threads_gate_sync(pthread_startgate);
-  threads_gate_sync(pthread_startgate2);
 /* ... and shutdown all threads */
   for (p=0; p<nproc; p++)
     QPTHREAD_JOIN(thread[p], NULL);
-  QPTHREAD_JOIN(movthread, NULL);
   threads_gate_end(pthread_startgate);
   threads_gate_end(pthread_stopgate);
-  threads_gate_end(pthread_startgate2);
-  threads_gate_end(pthread_stopgate2);
   QPTHREAD_MUTEX_DESTROY(&coaddmutex);
   QPTHREAD_ATTR_DESTROY(&pthread_attr);
   free(proc);
@@ -1967,9 +1955,6 @@ int	coadd_iload(fieldstruct *field, fieldstruct *wfield,
 			d, y, nflag, naxis;
     int			rawpos2[NAXIS],
 			ival, inoffset, inbeg, muloffset, width;
-#ifdef USE_THREADS
-    unsigned int	threadstep;
-#endif
 
   wcs = field->wcs;
   naxis = wcs->naxis;
@@ -1990,16 +1975,8 @@ int	coadd_iload(fieldstruct *field, fieldstruct *wfield,
     width = field->width;
 
 /* First, the data themselves */
-#ifdef USE_THREADS
-  pthread_wdataflag = 0;
-  pthread_npix = width;
-  pthread_step = multinmax;
-  threadstep = 0;
-  QMALLOC(lineibuf, FLAGTYPE, 2*field->width);
-#else
   QMALLOC(lineibuf, FLAGTYPE, field->width);
   linei = lineibuf;
-#endif
   for (d=naxis; --d;)
     rawpos2[d] = rawpos[d];
   multinbuf2 = multinbuf;
@@ -2034,20 +2011,9 @@ int	coadd_iload(fieldstruct *field, fieldstruct *wfield,
         field->tab->currentElement = (offset == 0) ? 1 : offset;
 #endif // HAVE_CFITSIO
         }
-#ifdef USE_THREADS
-      linei = lineibuf + (threadstep&1)*field->width;
-      read_ibody(field->tab, linei, field->width);
-      if (threadstep++)
-        threads_gate_sync(pthread_stopgate2);
-      pthread_lineibuf = linei+inoffset;
-      pthread_multiibuf = multiibuf+muloffset;
-      pthread_multinbuf = multinbuf2+inbeg;
-      threads_gate_sync(pthread_startgate2);
-#else
       read_ibody(field->tab, linei, field->width);
       coadd_moveidata(linei+inoffset,
 		multiibuf+muloffset, multinbuf2+inbeg, width, multinmax);
-#endif
       multiibuf += (size_t)outwidth*multinmax;
       multinbuf2 += outwidth;
       y--;
@@ -2076,9 +2042,6 @@ int	coadd_iload(fieldstruct *field, fieldstruct *wfield,
       nflag = 1;
     else
       {
-#ifdef USE_THREADS
-      linei = lineibuf + (threadstep&1)*field->width;
-#endif
       if (wfield)
         {
         if (nflag)
@@ -2103,18 +2066,8 @@ int	coadd_iload(fieldstruct *field, fieldstruct *wfield,
           }
         read_ibody(wfield->tab, linei, field->width);
         }
-#ifdef USE_THREADS
-      if (threadstep++)
-        threads_gate_sync(pthread_stopgate2);
-      pthread_wdataflag = 1;
-      pthread_lineibuf = wfield? (linei+inoffset) : NULL;
-      pthread_multiibuf = multiwibuf+muloffset;
-      pthread_multinbuf = multinbuf2+inbeg;
-      threads_gate_sync(pthread_startgate2);
-#else
       coadd_movewidata(wfield? (linei+inoffset) : NULL,
 		multiwibuf+muloffset, multinbuf2+inbeg, width, multinmax);
-#endif
       multiwibuf += (size_t)outwidth*multinmax;
       multinbuf2 += outwidth;
       y--;
@@ -2126,11 +2079,6 @@ int	coadd_iload(fieldstruct *field, fieldstruct *wfield,
       else
         rawpos2[d] = bufmin[d];
     }
-
-#ifdef USE_THREADS
-  if (threadstep++)
-    threads_gate_sync(pthread_stopgate2);
-#endif
 
   free(lineibuf);
 
@@ -2185,9 +2133,6 @@ int	coadd_load(fieldstruct *field, fieldstruct *wfield,
 			d, x,y, nflag, naxis;
     int			rawpos2[NAXIS],
 			ival, inoffset, inbeg, muloffset, width;
-#ifdef USE_THREADS
-    unsigned int	threadstep;
-#endif
 
   wcs = field->wcs;
   naxis = wcs->naxis;
@@ -2208,16 +2153,8 @@ int	coadd_load(fieldstruct *field, fieldstruct *wfield,
     width = field->width;
 
 /* First, the data themselves */
-#ifdef USE_THREADS
-  pthread_wdataflag = 0;
-  pthread_npix = width;
-  pthread_step = multinmax;
-  threadstep = 0;
-  QMALLOC(linebuf, PIXTYPE, 2*field->width);
-#else
   QMALLOC(linebuf, PIXTYPE, field->width);
   line = linebuf;
-#endif
   for (d=naxis; --d;)
     rawpos2[d] = rawpos[d];
   multinbuf2 = multinbuf;
@@ -2252,23 +2189,10 @@ int	coadd_load(fieldstruct *field, fieldstruct *wfield,
         field->tab->currentElement = (offset == 0) ? 1 : offset;
 #endif // HAVE_CFITSIO
         }
-#ifdef USE_THREADS
-      line = linebuf+(threadstep&1)*field->width;
-      read_body(field->tab, line, field->width);
-      if (threadstep++)
-        threads_gate_sync(pthread_stopgate2);
-      pthread_linebuf = line+inoffset;
-      pthread_multibuf = multibuf+muloffset;
-      pthread_multiobuf = multiobuf+muloffset;
-      pthread_origin    = &oid;
-      pthread_multinbuf = multinbuf2+inbeg;
-      threads_gate_sync(pthread_startgate2);
-#else
       read_body(field->tab, line, field->width);
       coadd_movedata(line+inoffset,
 		multibuf+muloffset, multiobuf+muloffset, multinbuf2+inbeg,
 		width, multinmax, oid);
-#endif
       multibuf += (size_t)outwidth*multinmax;
       multiobuf += outwidth*multinmax;
       multinbuf2 += outwidth;
@@ -2298,9 +2222,6 @@ int	coadd_load(fieldstruct *field, fieldstruct *wfield,
       nflag = 1;
     else
       {
-#ifdef USE_THREADS
-      line = linebuf+(threadstep&1)*field->width;
-#endif
       if (wfield)
         {
         if (nflag)
@@ -2332,18 +2253,8 @@ int	coadd_load(fieldstruct *field, fieldstruct *wfield,
               *linet = 0.0;
           }
         }
-#ifdef USE_THREADS
-      if (threadstep++)
-        threads_gate_sync(pthread_stopgate2);
-      pthread_wdataflag = 1;
-      pthread_linebuf = (wfield? (line+inoffset) : NULL);
-      pthread_multibuf = multiwbuf+muloffset;
-      pthread_multinbuf = multinbuf2+inbeg;
-      threads_gate_sync(pthread_startgate2);
-#else
       coadd_movewdata(wfield? (line+inoffset) : NULL,
 		multiwbuf+muloffset, multinbuf2+inbeg, width, multinmax);
-#endif
       multiwbuf += (size_t)outwidth*multinmax;
       multinbuf2 += outwidth;
       y--;
@@ -2355,11 +2266,6 @@ int	coadd_load(fieldstruct *field, fieldstruct *wfield,
       else
         rawpos2[d] = bufmin[d];
     }
-
-#ifdef USE_THREADS
-  if (threadstep++)
-    threads_gate_sync(pthread_stopgate2);
-#endif
 
   free(linebuf);
 
@@ -2373,53 +2279,6 @@ int	coadd_load(fieldstruct *field, fieldstruct *wfield,
   return RETURN_OK;
   }
 
-
-#ifdef USE_THREADS
-
-/****** pthread_move_lines ***************************************************
-PROTO	void *pthread_move_lines(void *arg)
-PURPOSE	thread that takes care of moving image "lines" from the input to the
-	co-addition buffer
-INPUT	Pointer to the thread number (unused).
-OUTPUT	-.
-NOTES	-.
-AUTHOR	E. Bertin (IAP)
-VERSION	10/03/2014
- ***/
-void	*pthread_move_lines(void *arg)
-  {
-  threads_gate_sync(pthread_startgate2);
-  while (!pthread_endflag)
-    {
-    if (pthread_wdataflag)
-      {
-      if (iflag)
-        coadd_movewidata(pthread_lineibuf, pthread_multiibuf, pthread_multinbuf,
-		pthread_npix, pthread_step);
-      else
-        coadd_movewdata(pthread_linebuf, pthread_multibuf, pthread_multinbuf,
-		pthread_npix, pthread_step);
-      }
-    else
-      {
-      if (iflag)
-        coadd_moveidata(pthread_lineibuf, pthread_multiibuf, pthread_multinbuf,
-		pthread_npix, pthread_step);
-      else
-        coadd_movedata(pthread_linebuf, pthread_multibuf, pthread_multiobuf,
-		pthread_multinbuf, pthread_npix, pthread_step, *pthread_origin);
-      }
-    threads_gate_sync(pthread_stopgate2);
-/*-- ( Master thread loads new data here ) */
-    threads_gate_sync(pthread_startgate2);
-    }
-
-  pthread_exit(NULL);
-
-  return (void *)NULL;
-  }
-
-#endif
 
 /******* coadd_movedata ******************************************************
 PROTO	void coadd_movedata(PIXTYPE *linebuf, PIXTYPE *multibuf,
